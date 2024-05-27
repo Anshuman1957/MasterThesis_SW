@@ -17,6 +17,7 @@ class Asteroid:
         self.Position = position # Location of the asteroid in 3D coordinates (x,y,z)
         self.Velocity = np.array([0,0,0])
         self.GeoRadius = round(self.ComputeGeostationaryOrbitRadius(),3)
+        self.EscapeVelocity = np.sqrt(2*self.Mass * scipy.constants.gravitational_constant / self.Radius)
         #Normalize axis unit vector
         self.Axis = axis / (np.linalg.norm(axis) + 1e-16)
 
@@ -25,22 +26,31 @@ class Asteroid:
     # reflectance(?), can be checked later if time is available
     # Any other info?
         
-    def PlotSatelliteOrbit(self,Satellite:Satellite,ax=None,fig=None,PlotOrbit=True,PlotInitialPosition=False,debug=False):
+    def PlotSatelliteOrbit(self,Satellite:Satellite,ax=None,fig=None,PlotOrbit=True,FociPosition=0,PlotInitialPosition=False,debug=False,**kwargs):
         '''Plots the input satellite's orbit around the asteroid considering the satellite's current parameters.
             r = (l^2)/(m^2 * mu) x (1/(1 + e cos (theta)))
             Theta -> Angle that r makes with periapsis of asteroid
             l -> angular momentum of the satellite
             mu -> Standard gravitational parameter
             e -> Eccentricity of the orbit
+            m -> Mass of the asteroid
             '''
         if fig is None:
             fig = plt.figure()
         if ax is None:
             ax = fig.add_subplot(projection='3d')
 
+        Xf = Satellite.Orbit.GetFociValues()[FociPosition][0]
+        Yf = Satellite.Orbit.GetFociValues()[FociPosition][1]
+        Zf = Satellite.Orbit.GetFociValues()[FociPosition][2]
+
         X0 = self.Position[0]
         Y0 = self.Position[1]
         Z0 = self.Position[2]
+
+        X0 = X0 - Xf
+        Y0 = Y0 - Yf
+        Z0 = Z0 - Zf
 
         self.UpdateSatellitePeriod(Satellite)
 
@@ -52,9 +62,21 @@ class Asteroid:
 
         #OrbitCoordinates = np.array(list(zip(Xn,Yn,Zn)))
         if PlotOrbit == True:
-            ax.plot(Xn,Yn,Zn,alpha=0.2)
+            if 'SatelliteOrbitColor' in kwargs.keys():
+                color = kwargs['SatelliteOrbitColor']
+            else:
+                color = 'b'
+            if 'OrbitAlpha' in kwargs.keys():
+                alpha = kwargs['OrbitAlpha']
+            else:
+                alpha = 0.2
+            ax.plot(Xn,Yn,Zn,alpha=alpha,color=color)
         if PlotInitialPosition == True:
-            ax.scatter(Xn[0],Yn[0],Zn[0],c='b')
+            if 'SatelliteMarkerColor' in kwargs.keys():
+                color = kwargs['SatelliteMarkerColor']
+            else:
+                color = 'b'
+            ax.scatter(Xn[0],Yn[0],Zn[0],c=color)
         ax.set_aspect('equal',anchor='C')
         ax.set_xlabel('X-axis')
         ax.set_ylabel('Y-axis')
@@ -141,7 +163,7 @@ class Asteroid:
         M -> Mass of the asteroid
         T -> Rotation period of the asteroid'''
 
-        return np.cbrt((scipy.constants.gravitational_constant * self.Mass * (self.RotationPeriod*60)**2)/(4*(np.pi**2)))
+        return np.cbrt((scipy.constants.gravitational_constant * self.Mass * (self.RotationPeriod*60)**2)/(4*(np.pi**2))) 
 
 class AsteroidField:
 

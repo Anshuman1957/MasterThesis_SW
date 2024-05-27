@@ -1,15 +1,21 @@
 import scipy.constants
 import numpy as np
-#from SatelliteModel import Satellite
 from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
 from collections import deque
+import math
 
 
-def GenerateCircleCoordinates(Radius,Eccentricity,NumPoints):
-    a = Radius
-    b = a* np.sqrt(1-(Eccentricity**2))
-    return np.array([(round(np.cos(2*np.pi/NumPoints*x)*a,4),round(np.sin(2*np.pi/NumPoints*x)*b,4),0) for x in range(0,NumPoints)])
+def GenerateOrbitCoordinates(Radius,Eccentricity,NumPoints):
+    '''Generates and returns the orbit coordinates and foci coordinates given the radius, eccentricity and number of orbit points.'''
+    a = Radius                              # Semi-major axis
+    b = a* np.sqrt(1-(Eccentricity**2))     # Semi-minor axis
+    OrbitCoordinates = np.array([(round(np.cos(2*np.pi/NumPoints*x)*a,4),round(np.sin(2*np.pi/NumPoints*x)*b,4),0) for x in range(0,NumPoints)])
+    F1 = (a*Eccentricity,0,0)
+    F2 = (-a*Eccentricity,0,0)
+    FociCoordinates = np.array([F1,F2],dtype=object)
+    retVal = (OrbitCoordinates,FociCoordinates)
+    return retVal
 
 class Rotation:
     
@@ -55,7 +61,7 @@ class Rotation:
     
 class Orbit:
 
-    def __init__(self,radius:int = 1, e:int=0,Rotations:list[Rotation]=[Rotation('x',0),Rotation('y',0)]):
+    def __init__(self,radius:int = 1, e:int=0,OrbitalPoints=360,Rotations:list[Rotation]=[Rotation('x',0),Rotation('y',0)]):
         '''Initializes the orbit parameters. The orbit is always considered to be centered at the origin (0,0,0). Handling the orbit center should be done by
             the plotting functions by adding the central mass' co-ordinates to the orbit co-ordinates. Alternatively, use the TranslateOrbit() class function to
             generate a set of translated orbits.'''
@@ -64,22 +70,22 @@ class Orbit:
         if e < 0:
             self.Eccentricity = 0
         elif e >= 1:
-            self.Eccentricity = 0.99
+            self.Eccentricity = 0.999
         else:
             self.Eccentricity = e
 
-        self.Radius = radius # Radius in kilometers
-        #self.OrbitalPeriod = T # Orbital period expressed in minutes
+        self.Radius = radius # Semi-major axis in kilometers
         self.OrbitalPeriod = 1 # In minutes, to be updated when defining for a specific body
         self.BasePlane = 'xy' # Initial plane is fixed to X-Y plane. It is not meant to be changed.
         self.Rotations = Rotations
-        self.OrbitalPoints = 360 # Number of positions to store in the orbit
+        self.OrbitalPoints = OrbitalPoints # Number of positions to store in the orbit
         
-        OrbitCoordinates = GenerateCircleCoordinates(self.Radius,self.Eccentricity,self.OrbitalPoints)
+        OrbitCoordinates,FociCoordinates = GenerateOrbitCoordinates(self.Radius,self.Eccentricity,self.OrbitalPoints)
         _ = self.StoreOrbitValues(OrbitCoordinates)
+        _ = self.StoreFociValues(FociCoordinates)
         _ = self.RotateOrbit()
 
-        self.OrbitPeriodRemainder = 0 # Variable to hold the remainder of division when plotting orbital position with time
+        self._OrbitPeriodRemainder = 0 # Variable to hold the remainder of division when plotting orbital position with time, UNUSED
 
     @property
     def BasePlane(self):
@@ -124,9 +130,18 @@ class Orbit:
     def GetOrbitValues(self):
         '''Returns the stored orbital position values'''
         return self._OrbitPoints
+    
+    def StoreFociValues(self,FociPositions:np.array):
+        '''Stores the orbit foci positions within the Orbit object for later use (mainly plotting)'''
+        self._FociPoints = FociPositions
+        return None
+    
+    def GetFociValues(self):
+        '''Returns the stored foci position values'''
+        return self._FociPoints
 
     def ShiftOrbit(self,n=1,reverse=False):
-        '''Rotate the orbital points by the input n value. Used to set the initial position in the orbit. 'reverse' input is currently unused as retrograde orbits are not considered.'''
+        '''Rotate the orbital points by the input n value. Used to set the initial position in the orbit. 'reverse' input is currently unused as retrograde orbits are not considered. Foci are not affected.'''
         OrbitCoordinates = self.GetOrbitValues()
         ShiftedCoordinates = np.roll(OrbitCoordinates,3*n) # n is multiplied by 3 because Coordinates is stored as a nx3 matrix (3 dimensions)
         self.StoreOrbitValues(ShiftedCoordinates)
@@ -143,15 +158,19 @@ class Orbit:
             CombinedRotationMatrix = self.Rotations[0].RotationMatrix
 
         OrbitCoordinates = self.GetOrbitValues()
+        FociCoordinates = self.GetFociValues()
         RotatedCoordinates = np.dot(OrbitCoordinates,CombinedRotationMatrix)
+        RotatedFoci = np.dot(FociCoordinates,CombinedRotationMatrix)
         _ = self.StoreOrbitValues(RotatedCoordinates)
+        _ = self.StoreFociValues(RotatedFoci)
 
         return None
     
     def ResetRotations(self):
         '''Resets the orbit coordinates to if no rotations were performed, i.e, on the xy plane.'''
-        OrbitCoordinates = GenerateCircleCoordinates(self.Radius,self.Eccentricity,self.OrbitalPoints)
+        OrbitCoordinates,FociCoordinates = GenerateOrbitCoordinates(self.Radius,self.Eccentricity,self.OrbitalPoints)
         _ = self.StoreOrbitValues(OrbitCoordinates)
+        _ = self.StoreFociValues(FociCoordinates)
 
 
     def TranslateOrbit(self,X0=0,Y0=0,Z0=0):
@@ -167,5 +186,18 @@ class Orbit:
         # There is probably a numpy function to do this in-place faster which I could try to explore, later, possibly
 
         return CoordinatesTranslated
+    
+    def StoreTimeValues(self,TimeArray:np.array,Period:int):
+        '''Stores the time array for this orbit if the period check is true.'''
+
+        if math.isclose(self.OrbitalPeriod,Period,rel_tol=0.1,abs_tol=0):
+            self._TimeArray = TimeArray
+        else:
+            print("Mismatched orbital times")
+            print(f"{Period=},{self.OrbitalPeriod=}")
+
+    def GetTimeValues(self):
+        '''Returns the time array stored for this orbit.'''
+        return self._TimeArray
 
         

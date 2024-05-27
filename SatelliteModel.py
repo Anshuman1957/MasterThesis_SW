@@ -1,9 +1,12 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from OrbitalElements import Orbit,Rotation
-import sys
+from OrbitalElements import Orbit
+import FunctionLibrary
+import copy
+from EventModel import Event
 
 class Satellite:
+
 
     def __init__(self,ID:int = 0,InitialPosition:np.array = np.array([0,0,0]),InitialRelativePosition:np.array = np.array([0,0,0])):
         '''Initializes the Satellite with the following information:
@@ -11,27 +14,46 @@ class Satellite:
         2. Co-ordinate position (Defaults to 3D co-ordinate geometry. Can choose quaternion representation)
         3. Initializes the parameter values (TBD)'''
         self.ID = ID # Identifier number for the satellite in the swarm
-        self.FoV = 0 #Field of View: Visual/Communication range of the satellite in 3 dimensional space in metres^3
-        self.PointingAccuracy = 1 # arcsecond, relevant for optical communication
-        self.DeltaV_MAX = 1.53 # m/s, reference: Operational_Concept_of_PicoSat_Release_From_LEOSat.pdf
         self.Mass = 1 # kg, Pico-satellite
-        self.UplinkRateMax = 1000 # kbps, tentative
-        self.DownlinkRateMax = 1000 # kbps, tentative
-        self.TransmitPower = 1 # Watts, typically 1 to 5 W, reference: R-REP-SA.2312-2014-PDF-E.pdf
         self.InitializePosition(InitialPosition) # Initialize the position of the satellite
         self.InitializeRelativePosition(InitialRelativePosition) # Initialize the relative position of the satellite
         self.Velocity = np.array([0,0,0]) # Velocity of the satellite in (x,y,z) in m/s
         self.Events = [] # Initialize an empty array of events attached to this satellite
         self.EventStates = [] # Current state of events (boolean)
         self.PreviousEventCheckTime = None # Simulation time in minutes when the last event check occured
-        self.SetTriggerCondition(0.5)
-        #self.BatteryCapacity =
-        #self.BatteryConsumptionUplink = 
-        #self.BatteryConsumtionDownlink = 
-        #self.CommunicationProtocol =
-        #self.RotationMatrix =
-        #self.TranslationMatrix = 
+        self._TriggerThreshold = 0
+        if self.ID != 0: # Followers
+            self.SetTriggerCondition(0.26) # 1/sqrt(SwarmSize)
+            #self.SetTriggerCondition(0.577)
+        else:
+            self.SetTriggerCondition(1)
+        self.SimulationTime = 0
+        self.ClearPositionHistory()
+        self.ClearRelativePositionHistory()
+        self.InformationMatrixHistory = []
+        self.UpdateTransmissionParameters()
+        self.ReceivedTransmissions = {}
+        self.Hierarchy = 'Follower'
+        self.MIN_DISTANCE_FACTOR = 4.605
+        self.LastTransmissionData = {'Event Information':[]}
+        self.TransmissionHistory = []
+
+        # EXPERIMENTAL
+        self.LastTransmitTime = -1000
+        self.MinimumTransmitInterval = 300
+        self.MaximumTransmitInterVal = 60000
+        self.TX_THIS_TIME = False # Used for plotting
+        self.U_DIFF_History = []
+        self.IgnoreRepeatData = False
         #self.Type = # Satellite role in the heterogeneous swarm
+
+    @property
+    def LastTransmitTime(self):
+        return self._LastTransmitTime
+    
+    @LastTransmitTime.setter
+    def LastTransmitTime(self,Time:int):
+        self._LastTransmitTime = Time
 
     @property
     def Position(self):
@@ -73,6 +95,10 @@ class Satellite:
         self._RelativeCoordinates = NewPositionRelative
         self._RelativePositionHistory.append(self._RelativeCoordinates)
     
+    def UpdateSwarmReference(self,InputSwarm:'Swarm'=None): # type: ignore
+        '''Circular reference to the parent swarm relevant for transmission trigger'''
+        self.SwarmReference = InputSwarm
+
     @property
     def TriggerThreshold(self):
         '''Property TriggerThreshold: float: Event trigger threshold to trigger transmission'''
@@ -125,17 +151,27 @@ class Satellite:
         '''Defines the Orbit of the satellite'''
         self.Orbit = Orbit
 
+    def UpdateSimulationTime(self,Time:float):
+        '''Updates the stored simulation time. To be called during the time super-loop in main'''
+        self.PreviousEventCheckTime = self.SimulationTime
+        self.SimulationTime = Time
+    
     def AddEvents(self,events):
         '''Adds the input Event(s) to the satellite event handler. Sets the initial event state to False.'''
         if isinstance(events,list):
             for event in events:
-                self.Events.append(event)
-                self.EventStates.append(False)
+                if event not in self.Events:
+                    self.Events.append(event)
+                    self.EventStates.append(event.State)
+                    self.LastTransmissionData['Event Information'].append(event.State)
         elif isinstance(events,Event):
-            self.Events.append(events)
-            self.EventStates.append(False)
+            if events not in self.Events:
+                self.Events.append(events)
+                self.EventStates.append(events.State)
+                self.LastTransmissionData['Event Information'].append(events.State)
         else:
             raise TypeError
+        
         
         return None
 
@@ -146,141 +182,328 @@ class Satellite:
 
         return None
 
-    def CheckEventStates(self,SimulationTime):
+    def CheckEventStates(self):
         '''Check if any events trigger based on simulation time. Returns a list of boolean values corresponding to the event trigger state.'''
-        #deltaT = SimulationTime - self.PreviousEventCheckTime if self.PreviousEventCheckTime is not None else (SimulationTime - 0)
-        T = SimulationTime
+        T = self.SimulationTime
         self.PreviousEventCheckTime = T
         retVal = []
-        for event in self.Events:
+        for index,event in enumerate(self.Events):
             EventState = event.CheckEventTrigger(T)
             retVal.append(EventState)
+            self.EventStates[index] = EventState
         self.CurrentEventStates = retVal
         return retVal
     
-    def ArbitrateEventStates(self,Events=None,EventStates=None):
+    def ArbitrateEventStates(self,Events:list[Event]=None,EventStates=None):
         '''Compute any external action required based on the event states. Call TriggerTransmission() if event(s) exceed defined action threshold.'''
         if Events is None:
             Events = self.Events
         if EventStates is None:
             EventStates = self.CurrentEventStates
 
-        Priorities = np.array([event.Priority for event in Events])
-        EventStatesInt = np.array(EventStates,dtype=int)
-        TriggerFactor = np.sum(Priorities*EventStatesInt)
+        T = self.SimulationTime
+        Priorities = np.array([event.Priority(T) for event in Events])
+        EventStatesInt = np.array(EventStates,dtype=bool)
+        EventStatesInverted = np.invert(EventStatesInt)
+        X_Matrix = Priorities*EventStatesInverted
+        TriggerFactor = np.linalg.norm(X_Matrix,ord=2)#sum(Priorities) - np.linalg.norm(X_Matrix,ord=2)
+        TriggerFactor = round(TriggerFactor,4)
         if self.CheckTransmissionConditions(TriggerFactor):
-            self.SetTriggerCondition(999)
+            #self.SetTriggerCondition(Threshold=1.00,Type='MULTIPLY')
+            pass
+
+        return None
 
     
-    def TriggerTransmission(self):
+    def TriggerTransmission(self,ForceTX=False) -> None:
         '''Trigger a (short-range radio) transmission broadcast intended for the leader of the swarm based on event status.'''
-        print(self.ID,self.PreviousEventCheckTime,sep=":")
+        #Construct the transmission information dictionary
+        TransmitInfo = {}
+        TransmitInfo['ID'] = self.ID
+        TransmitInfo['Time'] = self.SimulationTime
+        TransmitInfo['Position'] = self.Position
+        EventStates = list(np.array(self.EventStates,copy=True))
+        TransmitInfo['Event Information'] = EventStates # Update with specific event information
+        TransmitInfo['Events'] = [event.Name for event in self.Events]
+        TransmitInfo['Event Decay Time'] = [event.HoldTime for event in self.Events]
+        LastTXEventStates = self.LastTransmissionData['Event Information']
+        
+        if (EventStates == LastTXEventStates) and (ForceTX == False) and (self.IgnoreRepeatData == True): # If event info data is same as last time and it is not a forced Tx, abort transmission
+            return None
+        self.TX_THIS_TIME = True # Used for plotting purposes only
+        self.TransmissionHistory.append(TransmitInfo)
+        self.LastTransmitTime = copy.deepcopy(self.SimulationTime)
+        #if ForceTX == False: # Do not update Ucap if it is a forced transmission
+        self.U_CAP = np.array(self.InformationMatrix,copy=True)
 
-    def SetTriggerCondition(self,Threshold=0):
+        for satellite in self.SwarmReference.Members:
+            _ = satellite.ReceiveTransmission(TransmitInfo)
+
+
+    def ReceiveTransmission(self,TXData:dict=None) -> None:
+        '''Receive a transmission broadcast'''
+        
+        Distance = FunctionLibrary.P2Length(TXData['Position'],self.Position)
+        
+        if not isinstance(TXData,dict): # Ignore incorrect TXData format
+            pass
+        
+        elif TXData['ID'] == self.ID: # Ignore receiving your own transmission
+            self.LastTransmissionData = TXData
+        
+        elif Distance > self.ReceiverRange: # Ignore transmission if out of reception range
+            pass
+        
+        else:
+        # Transmission received
+            self.ReceivedTransmissions[TXData['ID']] = TXData
+        
+
+        # Consideration to use the received event data to compute information factor for an amount of time
+
+        return None
+
+        
+
+    def SetTriggerCondition(self,Threshold=0,Type=None):
         '''Assigns the trigger condition for the satellite. If the event threshold exceeds the assigned trigger condition, a transmission is triggered.
             The trigger condition is intended to be dynamic.'''
-        self.TriggerThreshold = Threshold
+        if Type == 'ADD':
+            self.TriggerThreshold = self.TriggerThreshold + Threshold
+        elif Type == 'MULTIPLY':
+            self.TriggerThreshold = self.TriggerThreshold * Threshold
+        elif Type == None:
+            self.TriggerThreshold = Threshold
+    
 
     def CheckTransmissionConditions(self,TriggerFactor = 1):
         '''Check conditions for successful transmission. These conditions are:
         1. Event threshold check
-        2. Radio communication to swarm leader check (TBD)'''
-        
+        2. Radio communication to swarm leader check (TBD)
+        3. Minimum time since last transmission check
+        4. Maximum time since last transmission check
+        5. Change in data. Check is performed in TriggerTransmission() function as the message is constructed there.'''
+
+        self.TX_THIS_TIME = False
+        retVal = None
         ConditionArray = []
-        if TriggerFactor >= self.TriggerThreshold:
+
+        # Min/Max time since last transmission check
+        TimeSinceLastTransmit = self.SimulationTime - self.LastTransmitTime
+        if (TimeSinceLastTransmit > self.MinimumTransmitInterval):
             ConditionArray.append(True)
         else:
             ConditionArray.append(False)
-        
-        if all(ConditionArray) == True:
+
+        # Check || U - u ||_2 <= Epsilon*TriggerFactor, Norm-2 of current and previous information matrix
+        InfoMatrixLocal = np.array(self.InformationMatrix,copy=True)
+        U_DIFF = np.linalg.norm(self.U_CAP - InfoMatrixLocal,ord=2)
+        self.U_DIFF_History.append(U_DIFF)
+        U_DIFF = round(U_DIFF,4)
+        TriggerThreshold = round(TriggerFactor*self.TriggerThreshold,4)
+        if U_DIFF >= (TriggerThreshold):
+            ConditionArray.append(True)
+        else:
+            ConditionArray.append(False)
+        if (TimeSinceLastTransmit >= self.MaximumTransmitInterVal):
+            self.TriggerTransmission(ForceTX=True)
+            retVal = True
+        elif (all(ConditionArray) == True):
             self.TriggerTransmission()
+            retVal = True
         else:
             pass # Do nothing
 
-class Event:
-    
-    def __init__(self,Name:str=None,Priority:float=0,Threshold:float=0.5,PDF=lambda x:x,RNG:np.random.Generator=None,AdditionalArguments:tuple=None,ThresholdType='FIXED',EventTriggeredFunction=lambda x:x,EventTriggeredArguments:tuple=None):
-        '''Initialize the event parameters.
-         1. Name -> string: Representative, non-functional
-         2. Priority -> float: Event priority
-         3. Threshold -> float: Threshold for event trigger probability to be recognized. Limited to [0,1]
-         4. PDF -> function: Probability Distribution Function
-         5. RNG -> Generator: Seeded RNG function of the form numpy.random.default_rng(#)'''
-        self.Name = Name
-        self.Priority = Priority
-        self.Threshold = max(min(Threshold,1),0)
-        self.ThresholdType = ThresholdType
-        self.PDF = PDF
-        self._RNG = None
-        self.EventTriggered = EventTriggeredFunction
-        DefaultRNG = np.random.default_rng(58235)
-        if RNG is None:
-            RNG = DefaultRNG
-        self.RNG = RNG # READ-ONLY, assigned once at initialization. Seeded RNG Function in the form numpy.random.default_rng(#) where # is the seed as an integer
-        self.LastTriggerTime = 0 # Simulaion time (min) of the previous event trigger
-        self.LastCheckTime = 0 # Time at which last event trigger check was performed
-        self.AdditionalArguments = AdditionalArguments # Additional arguments for each individual event
-        self.EventTriggeredArguments = EventTriggeredArguments # Additional arguments for event triggered function
+        return retVal
+    def ComputeOrbitParameters(self, OrbitPeriod:int,OrbitFoci:int=0) -> None:
+        '''Computes the orbital time parameters for the input asteroid object.'''
+        OrbitPositions = self.Orbit.GetOrbitValues()
+        if OrbitFoci > 1:
+            OrbitFoci = 0
+        Focus = self.Orbit.GetFociValues()[OrbitFoci]
+        T = OrbitPeriod
+        n = self.Orbit.OrbitalPoints
+        OrbitFraction = []
+        a = self.Orbit.Radius
+        b = a * np.sqrt(1-(self.Orbit.Eccentricity**2))
+        totalArea = round(np.pi * a * b,2)
+        intA = 0
+        for index,point in enumerate(OrbitPositions):
+            if index == 0:
+                point1 = point
+                point2 = point
+            else:
+                point1 = point
+                point2 = OrbitPositions[(index-1)%n]
+            # Compute area of triangle
+            dA = FunctionLibrary.P3Area(point1,point2,Focus)
+            # Compute fraction of area covered so far
+            intA = intA + dA
+            # Convert area to time
+            intT = round(intA / totalArea,4)
+            # Convert time to orbit ratio
+            dT = round(intT * T,4)
+            # Append to OrbitFraction array
+            OrbitFraction.append(dT)
 
-    @property
-    def RNG(self):
-        return self._RNG
-        
-    @RNG.setter
-    def RNG(self,RNG):
-        if self._RNG == None:
-            self._RNG = RNG
-        else:
-            pass
+        OrbitFraction.append(T) # The first and last time values are for the starting position of the orbit
+        self.Orbit.StoreTimeValues(OrbitFraction,T)
+
+        return None
+
+    def InitializeInformationMatrix(self,Size:int) -> None:
+        '''Initialize the Information matrix as an n-by-n matrix filled with zeros'''
+        self.InformationMatrix = np.zeros((Size,Size))
+        self.InformationMatrixPrev = self.InformationMatrix
+        InformationMatrix = np.array(self.InformationMatrix,copy=True)
+        self.U_CAP = np.linalg.norm(InformationMatrix,ord=2)
+        self.InformationMatrixHistory = []
+        self.TransmissionHistory = []
+        del InformationMatrix
+
         return None
     
-    def CheckFixedThresholdType(self):
-        '''Check if the event has a fixed threshold type.'''
-        if self.ThresholdType == 'FIXED':
-            return True
-        return False
+    def StoreInformationMatrix(self) -> None:
+        '''Updates the previous Information Matrix value with the current value'''
+        InformationMatrix = np.array(self.InformationMatrix,copy=True)
+        self.InformationMatrixHistory.append(InformationMatrix)
+        self.InformationMatrixPrev = InformationMatrix
+        del InformationMatrix
 
-    def CheckEventTrigger(self,Var=0):
-        '''Returns True if event triggers with the given parameters, else False.
-        The input 'Var' would generally refer to Time but this is not strictly necessary and depends on the underlying PDF.
-        How it works:
-        If the probability exceeds the threshold then event will trigger, else it will not.'''
-
-        retVal = False
-        DeltaVar = Var - self.LastCheckTime
-        if isinstance(self.AdditionalArguments,tuple):
-            P = self.PDF(Var,DeltaVar,*self.AdditionalArguments)
-        else:
-            P = self.PDF(Var,DeltaVar)
-
-        #Limit the probablity to the interval [0,1]
-        P = max(min(P,1),0)
-        if self.CheckFixedThresholdType() == True:
-            Threshold = self.Threshold
-        else:
-            Threshold = self.RNG.random()
-            if self.Threshold >= 1:
-                Threshold = self.Threshold
-        if P >= Threshold:
-            retVal = True
-            self.LastTriggerTime = Var
-            self.State = True
-            self.EventTriggerFunction()
-        else:
-            self.State = False
-
-        self.LastCheckTime = Var
-
-        return retVal
+        return None
     
-    def EventTriggerFunction(self):
-        '''Function called when event triggers. This function is used to handle threshold calculation for next trigger if an event is triggered.'''
-        if self.EventTriggeredArguments is not None:
-            self.Threshold = self.EventTriggered(self.Threshold,*self.EventTriggeredArguments)
+    def CheckInformationMatrixJacobian(self,dt:int=1) -> None:
+        '''Computes the Jacobian of the information matrix by taking the difference of the matrix with the previous iteration matrix'''
+        Jacobian = (self.InformationMatrix - self.InformationMatrixPrev)/dt
+        # Check || U - u ||2 <= Epsilon, Norm-2 of current and previous information matrix
+        uCap = np.array(self.InformationMatrix)
+        u = np.array(self.InformationMatrixPrev)
+        Diff = np.linalg.norm(uCap - u,ord=2)
+        #self.U_CAP = Diff
+
+        return None
+    
+    def UpdateSelfInformationFactor(self,Alpha:float=0.5,Beta:float=0.5,Time:float=0,ExpectedPosition:np.array=None,Noise:np.array=None,dMax:float = 20):
+        '''Computes,stores and returns the self-information factor of the satellite. If the ID of the satellite is 'x', then this self-information factor is \
+            a_(xx)'''
+        MINIMUM_INFORMATION_FACTOR = self.MIN_DISTANCE_FACTOR # Derived by solving the following for x: e^x = 1%
+        CurrentPosition = self.Position
+        if ExpectedPosition is not None:
+            ExpectedPosition = ExpectedPosition # Does nothing tbh, as long as it is a numpy array representing a coordinate
         else:
-            self.Threshold = self.EventTriggered(self.Threshold)
+            if Noise is None:
+                ExpectedPosition = CurrentPosition
+            else:
+                ExpectedPosition = CurrentPosition + Noise
+        FactorA = FunctionLibrary.InfoFactorA(Alpha=Alpha,Time=Time,EventList=self.Events,EventStates=self.EventStates,Estimate=False)
+        FactorB = FunctionLibrary.InfoFactorB(Beta,CurrentPosition,ExpectedPosition,dMax,MINIMUM_INFORMATION_FACTOR)
+        InformationFactor = round(FactorA + FactorB,4)
+        self.InformationFactor = InformationFactor
+        self.InformationMatrix[self.ID][self.ID] = InformationFactor
+
+        return InformationFactor
+    
+    def UpdateSelfCrossInformationFactor(self,InSat:'Satellite',Time:float=0,Alpha=0.5,Beta=0.5,dMax = 20,PosNoise = None,EventsKnown = False,Estimate=True, PositionKnown = False,delTMax:int = 0,Invert=False):
+        '''Computes, stores, and returns the cross-information factor of the satellite. If the ID of the (self) satellite is 'x' and cross satellite is 'y', then this information factor is a_(xy) which indicates what satellite 'x' knows about satellite 'y'. Also returns the self and input satellite's IDs.'''
+        # Estimate or Measure based on last received transmission and event decay time:
+        EstimateLoc = Estimate
+        Measure = None
+        # Check if transmission received at all
+        if InSat.ID not in self.ReceivedTransmissions.keys():
+            pass
+        else:
+            # Construct decay time matrix
+            currentTime = self.SimulationTime
+            lastRXTime = self.ReceivedTransmissions[InSat.ID]['Time']
+            TimeSinceLastRx = currentTime - lastRXTime
+            DecayArray = np.array(self.ReceivedTransmissions[InSat.ID]['Event Decay Time'])
+            StateArray = np.array(self.ReceivedTransmissions[InSat.ID]['Event Information'])
+            UpdatedEventArray = DecayArray * StateArray # This array contains the hold time for each event
+            EstimateLoc = TimeSinceLastRx >= UpdatedEventArray
+            if any(EstimateLoc):
+                Estimate = False
+                Measure = False
+        # Alpha term calculation
+        if Invert == True:
+            InSatRef = InSat
+            InSat = self
+        if EventsKnown == False:
+            term1 = 0
+        else:
+            term1 = FunctionLibrary.InfoFactorA(Alpha=Alpha,Time=Time,EventList=InSat.Events,Estimate=Estimate,Measure=Measure)
+
+        # Beta term calculation
+        if PositionKnown == False:
+            term2 = 0
+        else:
+            InSatPos = InSat.Position
+            if PosNoise is None:
+                InSatExpectedPosition = InSatPos
+            else:
+                InSatExpectedPosition = InSatPos + PosNoise
+            term2 = FunctionLibrary.InfoFactorB(Beta = Beta,P1=InSat.Position,P2=InSatExpectedPosition,P_MAX=dMax,MIN_FACTOR=InSat.MIN_DISTANCE_FACTOR)
+                
+        CrossFactor = round(term1 + term2,4)
+        if Invert == False:
+            self.InformationMatrix[InSat.ID][self.ID] = CrossFactor
+        else:
+            self.InformationMatrix[self.ID][InSatRef.ID] = CrossFactor
+
+        return (CrossFactor,self.ID,InSat.ID)
+    
+    def UpdateOtherCrossInformationFactor(self,InSat:'Satellite',InSat2:'Satellite',Time:float=0,Alpha=0.5,Beta=0.5,dMax=20,PosNoise=None,EventsKnown=False,Estimate=True,PositionKnown=False,delTMax:int=0):
+        '''Computes, stores, and returns the cross-information factor of the satellite. If the ID of the (self) satellite is 'x' and cross satellite is 'y', then this information factor is a_(yx) which indicates what satellite 'y' knows about satellite 'x'. Also returns the self and input satellite's IDs.'''
+        # Alpha term calculation
+        if EventsKnown == False:
+            term1 = 0
+        else:
+            term1 = FunctionLibrary.InfoFactorA(Alpha=Alpha,Time=Time,EventList=InSat2.Events,Estimate=Estimate)
+        
+        # Beta term calculation
+        if PositionKnown == False:
+            term2 = 0
+        else:
+            SatPos = InSat2.Position
+            if PosNoise is None:
+                SatExpectedPosition = SatPos
+            else:
+                SatExpectedPosition = SatPos + PosNoise
+            term2 = FunctionLibrary.InfoFactorB(Beta=Beta,P1=InSat2.Position,P2=SatExpectedPosition,P_MAX=dMax,MIN_FACTOR=self.MIN_DISTANCE_FACTOR)
+
+        CrossFactor = term1 + term2
+        self.InformationMatrix[InSat.ID][InSat2.ID] = CrossFactor
+        return (CrossFactor,InSat.ID,InSat2.ID)
+
+    def UpdateOtherSelfInformationFactor(self,InSat:'Satellite',Beta:float=1,Noise:np.array=None,NoiseFactor:np.array=None,dMax:float=20,Estimate:bool=True):
+        '''Estimate the self-information factor of the other input satellite.
+        Based on the last transmission received from the target satellite, the target self-information factor is scaled negatively based on the input Noise Factor arg.'''
+        CurrentPosition = InSat.Position
+        if InSat.ID in self.ReceivedTransmissions.keys():
+            TimeSinceLastReception = self.SimulationTime - self.ReceivedTransmissions[InSat.ID]['Time']
+        else:
+            TimeSinceLastReception = self.SimulationTime
+        DecayFactor = 1000
+        NoiseFactor = NoiseFactor * (TimeSinceLastReception/DecayFactor)
+        # self.ReceivedTransmissions
+        if Estimate == True:
+            ExpectedPosition = CurrentPosition + (Noise * NoiseFactor)
+        else:
+            ExpectedPosition = CurrentPosition + Noise
+        IF_A = FunctionLibrary.InfoFactorA(Alpha=Beta,Time=0,EventList=InSat.Events,EventStates=InSat.EventStates,Estimate=False,Measure=True)
+        IF_B = FunctionLibrary.InfoFactorB(Beta=Beta,P1=CurrentPosition,P2=ExpectedPosition,P_MAX=dMax,MIN_FACTOR=InSat.MIN_DISTANCE_FACTOR)
+        InformationFactor = IF_A + IF_B
+        self.InformationMatrix[InSat.ID][InSat.ID] = InformationFactor
+
+        return (InformationFactor,InSat.ID)
 
 
+    def UpdateTransmissionParameters(self,Power=10,Gain=20,FoV=360,Range=5000):
+        '''Updates the radio transmission parameters'''
+        self.TransmitterPower = Power # Watts
+        self.TransmitterGain = Gain # dB
+        self.TransmitterFoV = FoV # degrees
+        self.TransmitterRange = Range # km
+        self.ReceiverRange = Range # km
 
 
 if __name__ == "__main__":

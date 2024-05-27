@@ -1,7 +1,7 @@
-from SatelliteModel import Satellite, Event
+from SatelliteModel import Satellite
+from EventModel import Event
 import numpy as np
 import matplotlib.pyplot as plt
-from OrbitalElements import Orbit,Rotation
 
 class Swarm:
 
@@ -10,15 +10,22 @@ class Swarm:
 
         self.Members = SatelliteList
         self.SwarmSize = len(self.Members)
+        self._Leader = []
         self.Leader = SatelliteList[0]
         self.PreviousEventCheckTime = None
+        for satellite in self.Members:
+            satellite.UpdateSwarmReference(self)
+
+        Satellite_ID_Dict = {}
+        for satellite in self.Members:
+            Satellite_ID_Dict[satellite.ID] = satellite
+
+        self.Satellite_ID_Dict = Satellite_ID_Dict
 
         # Additional parameters:
-        # Swarm size (self.SwarmSize)
         # Swarm relative distance/position matrices
         # Swarm upkeep time?
         # Swarm housekeeping data (Depends on distance from ground station and mission length)
-        # Packet losses (Noise in transmission)
 
     def PrintID(self):
         '''Prints the ID of all the satellites in the swarm'''
@@ -26,18 +33,41 @@ class Swarm:
             print(f'{satellite.ID=}')
         return None
 
+    @property
+    def Leader(self):
+        '''Getter: Returns the internal leader list'''
+        return self._Leader
+    
+    @Leader.setter
+    def Leader(self,Leader):
+        '''Adds the input Leader (satellite or list object) to the internal leader list'''
+        if isinstance(Leader,Satellite):
+            if Leader not in self._Leader:
+                self._Leader.append(Leader)
+                Leader.Hierarchy = 'Leader'
+        elif isinstance(Leader,list):
+            for satellite in Leader:
+                if satellite not in self._Leader:
+                    satellite.Hierarchy = 'Leader'
+                    self._Leader.append(satellite)
 
-    def AssignLeader(self,InSat:Satellite):
-        '''Assigns the given satellite in the swarm to be the leader of the swarm. If the given satellite is not in the swarm, it is added to the swarm.'''
+    @Leader.deleter
+    def Leader(self):
+        '''Removes all leader satellites from the internal leader list'''
+        self._Leader = []
+
+    def AddLeader(self,InSat:Satellite):
+        '''Add the given satellite in the swarm to be the leader(s) of the swarm. If the given satellite is not in the swarm, it is added to the swarm.'''
         if InSat not in self.Members:
             self.Members.append(InSat)
-        self.Leader = InSat
+        if InSat not in self.Leader:
+            self.Leader.append(InSat)
+        self.SwarmSize = len(self.Members)
         return None
     
     def UpdateSwarmMembers(self,AddSats:list[Satellite]=None,DelSats:list[Satellite]=None):
-        '''Updates (Add or remove) satellites in the swarm followed by updating the related swarm parameters. Resets the leader to the 0th Satellite if the leader was removed.'''
+        '''Updates (Add or remove) satellites in the swarm followed by updating the related swarm parameters.'''
         localSwarm = self.Members
-        PrevLeader = self.Leader
         # Delete list
         if DelSats is not None:
             tempList = [sat for sat in localSwarm if sat not in DelSats]
@@ -49,14 +79,12 @@ class Swarm:
         # Update swarm parameters
         self.SwarmSize = len(localSwarm)
         self.Members = localSwarm
-        if PrevLeader not in self.Members:
-            self.Leader = self.Members[0]
         return None
     
-    def UpdateSwarmRelativePosition(self):
+    def UpdateSwarmRelativePosition(self,RefLeader:Satellite):
         '''Updates the position of all the swarm satellites with respect to the leader. The leader is treated as the origin'''
         for Satellite in self.Members:
-            Satellite.RelativePosition = Satellite.Position - self.Leader.Position # Leader is always at origin with respect to itself
+            Satellite.RelativePosition = Satellite.Position - RefLeader.Position # Leader is always at origin with respect to itself
         return None
     
     def PlotCurrentPosition(self, ax=None,fig=None):
@@ -83,13 +111,16 @@ class Swarm:
         '''Moves the swarm centered on a swarm satellite to the input location.'''
         pass
 
-    def CheckEvents(self,SimulationTime):
-        '''Checks swarm events based on current simulation time.'''
+    def CheckEvents(self,SimulationTime) -> None:
+        '''Update swarm event states based on current simulation time.'''
         
         for satellite in self.Members:
-            satelliteEvents = satellite.CheckEventStates(SimulationTime)
+            satellite.UpdateSimulationTime(SimulationTime)
+            satelliteEvents = satellite.CheckEventStates()
             satelliteArbitration = satellite.ArbitrateEventStates()
         self.PreviousEventCheckTime = SimulationTime
+
+        return None
     
     def AddCommonEvent(self,Events):
         '''Adds the input Event(s) to all the member satellites, including the Leader. Valid Event input is a list of Event classes or a single Event class.'''
@@ -101,7 +132,61 @@ class Swarm:
             return
         for satellite in self.Members:
             satellite.AddEvents(EventList)
+
+    def UpdateSimulationTime(self,Time:float):
+        '''Updates the simulation time for all satellites in the swarm'''
+        for satellite in self.Members:
+            satellite.UpdateSimulationTime(Time)
+
+    def InitializeInformationMatrix(self):
+        '''Trigger initialization of the information matrix of all sub-swarm members'''
+        Size = self.SwarmSize
+        for satellite in self.Members:
+            _ = satellite.InitializeInformationMatrix(Size)
+        return None
         
+    def SetFollowerTriggerParameter(self,Value:float=1):
+        '''Set the epsilon value of each follower satellite to the input value'''
+        for satellite in self.Members:
+            if satellite not in self.Leader:
+                satellite.SetTriggerCondition(Value)
+        return None
+    
+    def SetLeaderTriggerParameter(self,Value:float=1):
+        '''Set the epsilon value of each leader satellite to the input value'''
+        for satellite in self.Members:
+            if satellite in self.Leader:
+                satellite.SetTriggerCondition(Value)
+        return None
+
+    def SetTriggerParameter(self,Value:float=1):
+        '''Set the epsilon value of every satellite to the input value'''
+        for satellite in self.Members:
+            satellite.SetTriggerCondition(Value)
+        return None
+    
+    def GetSatelliteByID(self,ID:int):
+        '''Returns the satellite with the input ID'''
+        satellite = self.Satellite_ID_Dict[ID]
+        return satellite
+    
+    def SetMinimumTransmitInterval(self,Interval:int=300):
+        '''Sets the minimum transmit interval for each satellite in the swarm'''
+        for satellite in self.Members:
+            satellite.MinimumTransmitInterval = Interval
+        return None
+    
+    def SetMaximumTransmitInterval(self,Interval:int=60000):
+        '''Sets the minimum transmit interval for each satellite in the swarm'''
+        for satellite in self.Members:
+            satellite.MaximumTransmitInterVal = Interval
+        return None
+    
+    def UpdateIdenticalTransmitFlag(self,State:bool=False):
+        '''Updates the flag to enable/disable transmissions containing repeated data of previous transmissions'''
+        for satellite in self.Members:
+            satellite.IgnoreRepeatData = State
+        return None
 
 if __name__ == "__main__":
     x = Satellite(1)
